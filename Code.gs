@@ -6,8 +6,6 @@ const CONFIG = {
   EXTRA_ATTACHMENT_IDS: [],                      // Optional files sent to everyone
 
   // ALWAYS added to every email, in addition to whatever the draft has.
-  // Example: "a@gmail.com, b@gmail.com". Leave "" if not needed.
-  // This is the 100% guaranteed way to get Cc/Bcc on every email.
   FALLBACK_CC: "",
   FALLBACK_BCC: "",
 
@@ -18,7 +16,7 @@ const CONFIG = {
 const HANDLER = "onChangeSendEmail";
 let _pdfMap = null;
 
-/* ---------- Menu (manual, instant run) ---------- */
+/* ---------- Menu ---------- */
 
 function onOpen() {
   SpreadsheetApp.getUi()
@@ -60,6 +58,53 @@ function testDraftCcBcc() {
   }
 }
 
+/* ---------- Status rules ----------
+ * ""            -> pending (new row)
+ * "Failed..."   -> pending (retried)
+ * "Resend"      -> pending, and skips duplicate check (use to force a re-send)
+ * "Sent", "Partial...", "Sending...", "Duplicate of row N" -> never processed
+ */
+
+function isPending(status) {
+  return status === "" || /^failed/i.test(status) || /^resend/i.test(status) || /^not sent/i.test(status);
+}
+
+/**
+ * Marks every pending row from startRow down as "Not sent: <reason>".
+ * Reads fresh statuses from the sheet, so rows already handled this run are untouched.
+ * Rows that were "Resend" keep that intent as "Not sent (resend): ...".
+ */
+function markNotSent(sheet, reason, startRow) {
+  const last = sheet.getLastRow();
+  const from = Math.max(startRow || 2, 2);
+  const n = last - from + 1;
+  if (n < 1) return;
+
+  const vals = sheet.getRange(from, 1, n, 3).getValues();
+  const out = vals.map(r => {
+    const email = (r[0] || "").toString().trim();
+    const status = (r[2] || "").toString().trim();
+    if (!email || !isPending(status)) return [r[2]];
+    const tag = /^(resend|not sent \(resend\))/i.test(status) ? "Not sent (resend)" : "Not sent";
+    return [`${tag}: ${reason}`];
+  });
+  sheet.getRange(from, 3, n, 1).setValues(out);
+  SpreadsheetApp.flush();
+}
+
+/** Statuses that mean "this recipient already got (or is getting) a certificate". */
+function isDone(status) {
+  return /^(sent|partial|sending)/i.test(status);
+}
+
+/** Builds a duplicate-detection key: same recipient(s) + same name. */
+function makeKey(email, name) {
+  const emails = extractEmails(email).map(a => a.toLowerCase()).sort().join(",");
+  return emails + "|" + normalizeName(name);
+}
+
+/* ---------- Main ---------- */
+
 function onChangeSendEmail(e) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) {
@@ -82,17 +127,29 @@ function onChangeSendEmail(e) {
 
     const data = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
 
-    // Only continue if there is something to process
     const hasWork = data.some(r => {
       const email = (r[0] || "").toString().trim();
       const status = (r[2] || "").toString().trim();
-      return email && (status === "" || /^failed/i.test(status));
+      return email && isPending(status);
     });
     if (!hasWork) return;
+
+    // Register every row that was already sent, so new copies are caught as duplicates.
+    const seen = {};
+    for (let i = 0; i < data.length; i++) {
+      const email = (data[i][0] || "").toString().trim();
+      const name = (data[i][1] || "").toString().trim();
+      const status = (data[i][2] || "").toString().trim();
+      if (email && name && isDone(status)) {
+        const key = makeKey(email, name);
+        if (!seen[key]) seen[key] = i + 2;
+      }
+    }
 
     const draftToSend = findDraft(CONFIG.DRAFT_SUBJECT);
     if (!draftToSend) {
       Logger.log("Draft not found - nothing sent this run.");
+      markNotSent(sheet, `draft "${CONFIG.DRAFT_SUBJECT}" not found`, 2);
       return;
     }
     const message = draftToSend.getMessage();
@@ -111,12 +168,12 @@ function onChangeSendEmail(e) {
       }
     }).filter(Boolean);
 
-    const alreadySent = getAlreadySent(data);
-    _pdfMap = null; // reload PDF list fresh each run
+    _pdfMap = null;
 
     for (let idx = 0; idx < data.length; idx++) {
       if (Date.now() - startTime > CONFIG.MAX_RUNTIME_MS) {
         Logger.log("Time limit near - stopping. Remaining rows will be sent on the next change/run.");
+        markNotSent(sheet, "time limit reached, run again", idx + 2);
         break;
       }
 
@@ -125,26 +182,38 @@ function onChangeSendEmail(e) {
       const name = (data[idx][1] || "").toString().trim();
       const status = (data[idx][2] || "").toString().trim();
 
-      // Process empty status, or retry rows that previously failed
       if (!email) continue;
-      if (status !== "" && !/^failed/i.test(status)) continue;
+      if (!isPending(status)) continue;
 
       if (!name) {
         setStatus(sheet, rowNum, "Failed: name is empty");
         continue;
       }
 
-      const emailList = email.split(/[,;]/)
-        .map(a => a.trim())
-        .filter(a => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(a));
+      const allParts = email.split(/[,;]/).map(a => a.trim()).filter(Boolean);
+      const emailList = allParts.filter(a => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(a));
+      const invalidList = allParts.filter(a => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(a));
 
       if (emailList.length === 0) {
         setStatus(sheet, rowNum, "Failed: no valid email");
         continue;
       }
 
-      if (MailApp.getRemainingDailyQuota() < emailList.length) {
+      // Duplicate check (skipped when the status is "Resend")
+      const key = makeKey(email, name);
+      if (!/^(resend|not sent \(resend\))/i.test(status)) {
+        if (seen[key]) {
+          setStatus(sheet, rowNum, `Duplicate of row ${seen[key]}`);
+          continue;
+        }
+      }
+      if (!seen[key]) seen[key] = rowNum;
+
+      // Quota: every To, Cc and Bcc address counts.
+      const perEmail = 1 + extractEmails(draftCc).length + extractEmails(draftBcc).length;
+      if (MailApp.getRemainingDailyQuota() < emailList.length * perEmail) {
         Logger.log("Daily email quota exhausted - stopping.");
+        markNotSent(sheet, "daily email quota exhausted", rowNum);
         break;
       }
 
@@ -155,21 +224,30 @@ function onChangeSendEmail(e) {
         continue;
       }
 
-      sendRowEmails(sheet, rowNum, emailList, name, message, customPdf, extraAttachments, alreadySent, draftCc, draftBcc);
+      // Mark before sending so a timeout/crash can't cause a re-send.
+      setStatus(sheet, rowNum, "Sending...");
+      sendRowEmails(sheet, rowNum, emailList, invalidList, name, message, customPdf, extraAttachments, draftCc, draftBcc);
       Utilities.sleep(CONFIG.SEND_DELAY_MS);
+    }
+  } catch (err) {
+    Logger.log("Unexpected error: " + err.message);
+    try {
+      const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_NAME);
+      if (sheet) markNotSent(sheet, "error: " + err.message, 2);
+    } catch (e2) {
+      Logger.log("Could not write Not sent status: " + e2.message);
     }
   } finally {
     lock.releaseLock();
   }
 }
 
-/** Writes status and pushes it to the sheet immediately. */
 function setStatus(sheet, row, value) {
   sheet.getRange(row, 3).setValue(value);
   SpreadsheetApp.flush();
 }
 
-/* ---------- PDF lookup (case/space-insensitive) ---------- */
+/* ---------- PDF lookup ---------- */
 
 function normalizeName(s) {
   return s.toString().replace(/\.pdf$/i, "").replace(/\s+/g, " ").trim().toLowerCase();
@@ -186,7 +264,11 @@ function loadPdfMap() {
     const f = files.next();
     if (f.getMimeType() === MimeType.PDF) {
       const key = normalizeName(f.getName());
-      if (!_pdfMap[key]) _pdfMap[key] = f; // first match wins
+      if (_pdfMap[key]) {
+        Logger.log(`Warning: multiple PDFs match "${key}". Using the first one.`);
+      } else {
+        _pdfMap[key] = f;
+      }
     }
   }
   Logger.log(`Loaded ${Object.keys(_pdfMap).length} PDFs from folder.`);
@@ -205,7 +287,6 @@ function getCustomCertificate(recipientName) {
 
 /* ---------- Draft helpers ---------- */
 
-/** Finds the draft by subject. If several match, uses the most recent one. */
 function findDraft(subject) {
   const target = subject.trim().toLowerCase();
   const drafts = GmailApp.getDrafts();
@@ -230,14 +311,12 @@ function findDraft(subject) {
   return best;
 }
 
-/** Extracts plain email addresses from any header-like string. */
 function extractEmails(str) {
   if (!str) return [];
   const found = str.toString().match(/[A-Za-z0-9._%+\-']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g);
   return found || [];
 }
 
-/** Reads a header (e.g. "Cc") from a raw RFC822 message, handling folded lines. */
 function getRawHeader(raw, headerName) {
   const headerPart = raw.split(/\r?\n\r?\n/)[0];
   const unfolded = headerPart.replace(/\r?\n[ \t]+/g, " ");
@@ -246,7 +325,6 @@ function getRawHeader(raw, headerName) {
   return m ? m[1] : "";
 }
 
-/** Merges lists of addresses, removing duplicates. */
 function mergeEmails() {
   const seen = {};
   const out = [];
@@ -259,10 +337,6 @@ function mergeEmails() {
   return out.join(",");
 }
 
-/**
- * Tries 4 ways to read Cc/Bcc from the draft, then adds the CONFIG fallbacks.
- * Returns {cc, bcc, debug[]}.
- */
 function getDraftCcBcc(draft) {
   const message = draft.getMessage();
   const debug = [];
@@ -309,7 +383,7 @@ function getDraftCcBcc(draft) {
     debug.push("3 Gmail service skipped: " + err.message);
   }
 
-  // Method 4: Gmail REST API using the script's own token (no service needed)
+  // Method 4: Gmail REST API using the script's own token
   if (!cc && !bcc) {
     try {
       const url = "https://gmail.googleapis.com/gmail/v1/users/me/drafts/" + draft.getId() +
@@ -338,7 +412,6 @@ function getDraftCcBcc(draft) {
     }
   }
 
-  // Add guaranteed addresses from CONFIG
   cc = mergeEmails(cc, CONFIG.FALLBACK_CC);
   bcc = mergeEmails(bcc, CONFIG.FALLBACK_BCC);
 
@@ -349,71 +422,67 @@ function getDraftCcBcc(draft) {
   return { cc: cc, bcc: bcc, debug: debug };
 }
 
-function fillPlaceholders(text, name) {
-  return text.replace(/{{\s*name\s*}}/gi, name);
+/* ---------- Placeholders ---------- */
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-/* ---------- Duplicate tracking (email + name) ---------- */
-
-function sentKey(email, name) {
-  return email.trim().toLowerCase() + "|" + normalizeName(name);
+/** Function replacer so "$&" or "$1" in a name is never treated as a pattern. */
+function fillPlaceholders(text, name, asHtml) {
+  const value = asHtml ? escapeHtml(name) : name;
+  return text.replace(/{{\s*name\s*}}/gi, () => value);
 }
 
-function getAlreadySent(data) {
-  const sent = new Set();
-  data.forEach(row => {
-    const name = (row[1] || "").toString();
-    const status = (row[2] || "").toString();
+/* ---------- Inline images (logos, signatures) ---------- */
 
-    if (status === "Sent") {
-      (row[0] || "").toString().split(/[,;]/)
-        .map(e => e.trim()).filter(Boolean)
-        .forEach(e => sent.add(sentKey(e, name)));
-    } else if (/^partial/i.test(status)) {
-      const match = status.match(/sent to (.*?)(?:;\s*(?:duplicate|failed)|$)/i);
-      if (match) {
-        match[1].split(",")
-          .map(e => e.trim()).filter(Boolean)
-          .forEach(e => sent.add(sentKey(e, name)));
-      }
-    }
-  });
-  return sent;
+/** Maps each cid: reference in the HTML to an inline image blob, in order. */
+function buildInlineImages(message, html) {
+  const blobs = message.getAttachments({ includeInlineImages: true, includeAttachments: false });
+  const cids = [];
+  const re = /src=["']cid:([^"']+)["']/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    if (cids.indexOf(m[1]) === -1) cids.push(m[1]);
+  }
+  const map = {};
+  for (let i = 0; i < Math.min(cids.length, blobs.length); i++) {
+    map[cids[i]] = blobs[i];
+  }
+  return map;
 }
 
 /* ---------- Sending ---------- */
 
-function sendRowEmails(sheet, row, emailList, name, message, customPdf, extraAttachments, alreadySent, draftCc, draftBcc) {
-  const attachments = [customPdf].concat(message.getAttachments()).concat(extraAttachments || []);
+function sendRowEmails(sheet, row, emailList, invalidList, name, message, customPdf, extraAttachments, draftCc, draftBcc) {
+  // Regular attachments only (inline images are handled separately)
+  const draftAttachments = message.getAttachments({ includeInlineImages: false });
+  const attachments = [customPdf].concat(draftAttachments).concat(extraAttachments || []);
 
-  const subject = fillPlaceholders(message.getSubject(), name);
-  const plainBody = fillPlaceholders(message.getPlainBody(), name);
-  const htmlBody = fillPlaceholders(message.getBody(), name);
+  const rawHtml = message.getBody();
+  const inlineImages = buildInlineImages(message, rawHtml);
+
+  const subject = fillPlaceholders(message.getSubject(), name, false);
+  const plainBody = fillPlaceholders(message.getPlainBody(), name, false);
+  const htmlBody = fillPlaceholders(rawHtml, name, true);
 
   const succeeded = [];
   const failed = [];
-  const duplicates = [];
 
   emailList.forEach(recipient => {
-    const key = sentKey(recipient, name);
-
-    if (alreadySent.has(key)) {
-      duplicates.push(recipient);
-      return;
-    }
-
     try {
       const mailOptions = {
         htmlBody: htmlBody,
         attachments: attachments,
         name: CONFIG.SENDER_NAME,
       };
+      if (Object.keys(inlineImages).length > 0) mailOptions.inlineImages = inlineImages;
       if (draftCc) mailOptions.cc = draftCc;
       if (draftBcc) mailOptions.bcc = draftBcc;
 
       GmailApp.sendEmail(recipient, subject, plainBody, mailOptions);
       succeeded.push(recipient);
-      alreadySent.add(key);
       Logger.log(`Sent certificate to ${name} <${recipient}> | Cc="${draftCc}" Bcc="${draftBcc}"`);
     } catch (err) {
       failed.push(recipient + " (" + err.message + ")");
@@ -421,20 +490,16 @@ function sendRowEmails(sheet, row, emailList, name, message, customPdf, extraAtt
     }
   });
 
-  const parts = [];
-  if (succeeded.length) parts.push("sent to " + succeeded.join(", "));
-  if (duplicates.length) parts.push("duplicate (already sent): " + duplicates.join(", "));
-  if (failed.length) parts.push("failed: " + failed.join("; "));
-
   let statusValue;
-  if (succeeded.length === 0 && failed.length === 0 && duplicates.length > 0) {
-    statusValue = "Duplicate - already sent: " + duplicates.join(", ");
-  } else if (failed.length === 0 && duplicates.length === 0) {
+  if (failed.length === 0) {
     statusValue = "Sent";
-  } else if (succeeded.length === 0 && failed.length > 0) {
+  } else if (succeeded.length === 0) {
     statusValue = "Failed: " + failed.join("; ");
   } else {
-    statusValue = "Partial - " + parts.join("; ");
+    statusValue = "Partial - sent to " + succeeded.join(", ") + "; failed: " + failed.join("; ");
+  }
+  if (invalidList && invalidList.length > 0 && succeeded.length > 0) {
+    statusValue += ` (skipped invalid: ${invalidList.join(", ")})`;
   }
 
   setStatus(sheet, row, statusValue);
