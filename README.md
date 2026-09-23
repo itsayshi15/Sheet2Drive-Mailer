@@ -83,8 +83,4 @@ To preserve `CC` and `BCC` fields from your Gmail draft template:
 2. Click **Services** (`+`) in the left panel.
 3. Select and add **Gmail API**.
 
----
 
-## 📄 License
-
-This project is licensed under the MIT License.
