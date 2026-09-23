@@ -1,8 +1,8 @@
 const CONFIG = {
   SHEET_NAME: "Sheet1",                          // Exact name of your sheet tab
-  DRAFT_SUBJECT: "Your Certificate",             // Exact subject of your Gmail draft
-  SENDER_NAME: "Your Sender Name Here",          // <-- change this
-  CERTIFICATES_FOLDER_ID: "1ZWXmpgWo8hG2_dPUzQNvbSVuP8K-kqB4",
+  DRAFT_SUBJECT: "XXXXXXXXXX",             // Exact subject of your Gmail draft
+  SENDER_NAME: "XXXXXXXXX",          // <-- change this
+  CERTIFICATES_FOLDER_ID: "XXXXXXXXX",
   EXTRA_ATTACHMENT_IDS: [],                      // Optional files sent to everyone
 
   // ALWAYS added to every email, in addition to whatever the draft has.
